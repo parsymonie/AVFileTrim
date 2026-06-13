@@ -22,19 +22,21 @@
 ```
 
 Trim a binary file at regular byte increments and upload each slice to
-[VirusTotal](https://www.virustotal.com) to pinpoint exactly where an antivirus
-signature starts. Useful for security research, malware analysis, and
+[VirusTotal](https://www.virustotal.com) or
+[MetaDefender](https://metadefender.opswat.com) to pinpoint exactly where an
+antivirus signature starts. Useful for security research, malware analysis, and
 understanding detection heuristics.
 
 ---
 
 ## Features
 
+- **Multiple scanners** — VirusTotal or MetaDefender, selectable with `--scanner`
 - **Linear scan** — upload every slice and record detections at each offset
 - **Bisect scan** — binary-search for the first detected offset, minimising API calls
 - **Offline mode** — no API key needed; slices are written to disk for manual upload
 - **Dry run** — preview slice offsets without touching the network or disk
-- **JSON export** — machine-readable results with per-engine hits and VT permalinks
+- **JSON export** — machine-readable results with per-engine hits and report permalinks
 - **Configurable output directory** — defaults to `./out/`
 
 ---
@@ -65,8 +67,9 @@ avfiletrim [OPTIONS] FILE
 | --- | --- | --- | --- |
 | `--increment` | `-i` | `4096` | Byte step between slices |
 | `--strategy` | `-s` | `linear` | `linear` or `bisect` |
-| `--api-key` | `-k` | `$VT_API_KEY` | VirusTotal API key (optional) |
-| `--delay` | `-d` | `16.0` | Seconds between uploads |
+| `--scanner` | `-S` | `virustotal` | `virustotal` or `metadefender` |
+| `--api-key` | `-k` | env var | API key for the chosen scanner (optional) |
+| `--delay` | `-d` | per-scanner | Seconds between uploads (16 VT / 6 MetaDefender) |
 | `--output` | `-o` | — | Save scan results as JSON |
 | `--output-dir` | `-O` | `out/` | Directory for offline slices |
 | `--dry-run` | | | Preview offsets only |
@@ -74,8 +77,11 @@ avfiletrim [OPTIONS] FILE
 ### Examples
 
 ```bash
-# Slice every 8 KB and scan — API key from environment variable
+# Slice every 8 KB and scan with VirusTotal — key from environment variable
 VT_API_KEY=xxxx avfiletrim malware.exe -i 8192
+
+# Scan with MetaDefender instead
+MCL_API_KEY=xxxx avfiletrim malware.exe -S metadefender
 
 # Binary-search with explicit key, save results
 avfiletrim sample.exe -s bisect -k $VT_API_KEY -o results.json
@@ -107,14 +113,23 @@ results after manual upload.
 
 ---
 
-## VirusTotal API key
+## API keys
 
-Sign up at <https://www.virustotal.com> for a free API key (4 requests/minute,
-500 requests/day). Set it as an environment variable or pass it via `--api-key`:
+Each scanner reads its key from a dedicated environment variable, or you can
+pass it explicitly with `--api-key`:
+
+| Scanner | Sign up | Environment variable |
+| --- | --- | --- |
+| VirusTotal | <https://www.virustotal.com> | `VT_API_KEY` |
+| MetaDefender | <https://metadefender.opswat.com> | `MCL_API_KEY` |
 
 ```bash
-export VT_API_KEY=your_key_here
+export VT_API_KEY=your_virustotal_key
+export MCL_API_KEY=your_metadefender_key
 ```
+
+Free tiers are rate-limited (VirusTotal: 4 req/min, 500/day), so AVFileTrim
+throttles uploads automatically; tune the pace with `--delay`.
 
 ---
 

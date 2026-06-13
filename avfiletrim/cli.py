@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import click
@@ -9,14 +10,39 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
+from .base import Scanner, ScannerError
+from .metadefender import MetaDefenderClient
 from .models import ScanResult, TrimJob
+from .scanner import VirusTotalClient
 from .trimmer import iter_slices, sha256_of
-from .scanner import VirusTotalClient, VirusTotalError
 
 console = Console()
 
 _BANNER_FONT = "slant"
 _BANNER_SUBTITLE = "AV signature boundary finder"
+
+# Per-backend settings: env var holding the API key and a safe default upload
+# delay (seconds) for the free tier.
+_SCANNER_CONFIG = {
+    "virustotal": {"env_var": "VT_API_KEY", "default_delay": 16.0},
+    "metadefender": {"env_var": "MCL_API_KEY", "default_delay": 6.0},
+}
+
+
+def create_scanner(scanner_name: str, api_key: str, request_delay: float) -> Scanner:
+    """Instantiate the scanner backend selected on the command line.
+
+    Args:
+        scanner_name: Backend identifier — 'virustotal' or 'metadefender'.
+        api_key: API key for the chosen backend.
+        request_delay: Seconds to wait between consecutive uploads.
+
+    Returns:
+        A ready-to-use scanner client implementing the Scanner protocol.
+    """
+    if scanner_name == "metadefender":
+        return MetaDefenderClient(api_key=api_key, request_delay=request_delay)
+    return VirusTotalClient(api_key=api_key, request_delay=request_delay)
 
 
 def print_banner() -> None:
@@ -69,17 +95,23 @@ def build_results_table(results: list[ScanResult]) -> Table:
     help="linear: scan every increment; bisect: binary-search for first detection. Requires --api-key.",
 )
 @click.option(
+    "--scanner", "-S",
+    type=click.Choice(["virustotal", "metadefender"]),
+    default="virustotal",
+    show_default=True,
+    help="Online scanner backend to use.",
+)
+@click.option(
     "--api-key", "-k",
-    envvar="VT_API_KEY",
     default=None,
-    help="VirusTotal API key (or set VT_API_KEY). Omit to save slices to disk instead.",
+    help="API key for the chosen scanner (or set VT_API_KEY / MCL_API_KEY). "
+         "Omit to save slices to disk instead.",
 )
 @click.option(
     "--delay", "-d",
     type=float,
-    default=16.0,
-    show_default=True,
-    help="Seconds between uploads (free tier: 4 req/min → 16 s).",
+    default=None,
+    help="Seconds between uploads (default: 16 for virustotal, 6 for metadefender).",
 )
 @click.option(
     "--output", "-o",
@@ -104,28 +136,41 @@ def main(
     file: Path,
     increment: int,
     strategy: str,
+    scanner: str,
     api_key: str | None,
-    delay: float,
+    delay: float | None,
     output: Path | None,
     output_dir: Path,
     dry_run: bool,
 ) -> None:
-    """Trim FILE at byte increments and scan each slice on VirusTotal.
+    """Trim FILE at byte increments and scan each slice with an online scanner.
 
-    Without --api-key the slices are written to disk for manual upload.
+    Supports VirusTotal and MetaDefender. Without --api-key the slices are
+    written to disk for manual upload.
 
     \b
     Examples:
       avfiletrim malware.exe -i 8192
       avfiletrim malware.exe -i 4096 -O ./slices
-      avfiletrim malware.exe -i 4096 -s bisect -k $VT_API_KEY -o results.json
+      avfiletrim malware.exe -s bisect -k $VT_API_KEY -o results.json
+      avfiletrim malware.exe -S metadefender -k $MCL_API_KEY
       avfiletrim malware.exe -i 1024 --dry-run
     """
     print_banner()
 
+    config = _SCANNER_CONFIG[scanner]
+    if not api_key:
+        api_key = os.environ.get(config["env_var"])
+    if delay is None:
+        delay = config["default_delay"]
+
     file_size = file.stat().st_size
     console.print(f"[bold]Target:[/bold] [#ff69b4]{file.name}[/#ff69b4] ({file_size:,} bytes)")
-    console.print(f"[bold]Strategy:[/bold] [#ffb6c1]{strategy}[/#ffb6c1]   [bold]Increment:[/bold] [#ffb6c1]{increment:,}[/#ffb6c1] bytes\n")
+    console.print(
+        f"[bold]Scanner:[/bold] [#ffb6c1]{scanner}[/#ffb6c1]   "
+        f"[bold]Strategy:[/bold] [#ffb6c1]{strategy}[/#ffb6c1]   "
+        f"[bold]Increment:[/bold] [#ffb6c1]{increment:,}[/#ffb6c1] bytes\n"
+    )
 
     if dry_run:
         slice_offsets = [offset for offset, _ in iter_slices(file, increment)]
@@ -140,11 +185,11 @@ def main(
 
     job = TrimJob(source=file, increment=increment, strategy=strategy, api_key=api_key)
 
-    with VirusTotalClient(api_key=api_key, request_delay=delay) as vt_client:
+    with create_scanner(scanner, api_key, delay) as scanner_client:
         if strategy == "linear":
-            run_linear_scan(vt_client, job, file)
+            run_linear_scan(scanner_client, job, file)
         else:
-            run_bisect_scan(vt_client, job, file, increment)
+            run_bisect_scan(scanner_client, job, file, increment)
 
     console.print()
     console.print(build_results_table(job.results))
@@ -179,11 +224,11 @@ def run_offline(source: Path, increment: int, output_dir: Path) -> None:
     console.print(f"\n[#ff69b4]Done — {len(slices)} slices written to {output_dir}/[/#ff69b4]")
 
 
-def run_linear_scan(vt_client: VirusTotalClient, job: TrimJob, source: Path) -> None:
+def run_linear_scan(scanner_client: Scanner, job: TrimJob, source: Path) -> None:
     """Upload every slice sequentially and record results.
 
     Args:
-        vt_client: Authenticated VirusTotal client.
+        scanner_client: Authenticated scanner backend.
         job: TrimJob holding configuration; results are appended in-place.
         source: Path to the source binary.
     """
@@ -194,8 +239,8 @@ def run_linear_scan(vt_client: VirusTotalClient, job: TrimJob, source: Path) -> 
         for idx, (offset, data) in enumerate(slices, 1):
             status.update(f"[cyan]Scanning slice {idx}/{total_slices}[/cyan] — offset {offset:,}")
             try:
-                result = vt_client.scan_bytes(data, offset, suffix=source.suffix or ".bin")
-            except VirusTotalError as error:
+                result = scanner_client.scan_bytes(data, offset, suffix=source.suffix or ".bin")
+            except ScannerError as error:
                 console.print(f"[red]Error at offset {offset:,}: {error}[/red]")
                 continue
             job.results.append(result)
@@ -207,7 +252,7 @@ def run_linear_scan(vt_client: VirusTotalClient, job: TrimJob, source: Path) -> 
 
 
 def run_bisect_scan(
-    vt_client: VirusTotalClient,
+    scanner_client: Scanner,
     job: TrimJob,
     source: Path,
     increment: int,
@@ -218,7 +263,7 @@ def run_bisect_scan(
     boundary at *increment* granularity.
 
     Args:
-        vt_client: Authenticated VirusTotal client.
+        scanner_client: Authenticated scanner backend.
         job: TrimJob holding configuration; results are appended in-place.
         source: Path to the source binary.
         increment: Granularity of the bisect (snapped to nearest multiple).
@@ -232,7 +277,7 @@ def run_bisect_scan(
     full_data = source.read_bytes()
 
     with console.status("Scanning full file…"):
-        full_result = vt_client.scan_bytes(full_data, file_size, suffix=source.suffix or ".bin")
+        full_result = scanner_client.scan_bytes(full_data, file_size, suffix=source.suffix or ".bin")
     job.results.append(full_result)
 
     if not full_result.detected:
@@ -249,8 +294,8 @@ def run_bisect_scan(
         with console.status(f"Bisect [{low:,} … {high:,}] — trying {mid:,}"):
             data = slice_file(source, mid)
             try:
-                result = vt_client.scan_bytes(data, mid, suffix=source.suffix or ".bin")
-            except VirusTotalError as error:
+                result = scanner_client.scan_bytes(data, mid, suffix=source.suffix or ".bin")
+            except ScannerError as error:
                 console.print(f"[red]Error at {mid:,}: {error}[/red]")
                 break
         job.results.append(result)

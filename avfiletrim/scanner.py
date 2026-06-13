@@ -5,6 +5,7 @@ from pathlib import Path
 
 import httpx
 
+from .base import ScannerError
 from .models import ScanResult
 
 _VT_API_BASE_URL = "https://www.virustotal.com/api/v3"
@@ -12,7 +13,7 @@ _VT_API_BASE_URL = "https://www.virustotal.com/api/v3"
 _DEFAULT_REQUEST_DELAY = 16.0
 
 
-class VirusTotalError(Exception):
+class VirusTotalError(ScannerError):
     """Raised when the VirusTotal API returns an unexpected response."""
 
 

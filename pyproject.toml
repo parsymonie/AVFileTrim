@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "avfiletrim"
-version = "0.2.0"
-description = "Incrementally trim binary files and scan each slice with VirusTotal to locate AV signature boundaries"
+version = "0.3.0"
+description = "Incrementally trim binary files and scan each slice with VirusTotal or MetaDefender to locate AV signature boundaries"
 requires-python = ">=3.11"
 dependencies = [
     "click>=8.1",
