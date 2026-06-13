@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
-import sys
-import time
 from pathlib import Path
 
 import click
+import pyfiglet
 from rich.console import Console
 from rich.table import Table
 from rich import box
@@ -17,21 +15,39 @@ from .scanner import VirusTotalClient, VirusTotalError
 
 console = Console()
 
+_BANNER_FONT = "slant"
+_BANNER_SUBTITLE = "AV signature boundary finder"
 
-def _build_table(results: list[ScanResult]) -> Table:
+
+def print_banner() -> None:
+    """Print the project ASCII art banner to the console."""
+    ascii_art = pyfiglet.figlet_format("AVFileTrim", font=_BANNER_FONT)
+    console.print(f"[bold #ff69b4]{ascii_art}[/bold #ff69b4]", end="")
+    console.print(f"  [#ffb6c1]{_BANNER_SUBTITLE}[/#ffb6c1]\n")
+
+
+def build_results_table(results: list[ScanResult]) -> Table:
+    """Build a Rich table summarising scan results.
+
+    Args:
+        results: List of scan results to display.
+
+    Returns:
+        Populated Rich Table object ready to render.
+    """
     table = Table(box=box.ROUNDED, show_lines=False)
-    table.add_column("Offset", justify="right", style="cyan")
+    table.add_column("Offset", justify="right", style="#ff69b4")
     table.add_column("Size", justify="right", style="dim")
     table.add_column("Detections", justify="center")
     table.add_column("SHA-256", style="dim", no_wrap=True)
 
-    for r in results:
-        det_style = "red bold" if r.detected else "green"
+    for result in results:
+        detection_style = "red bold" if result.detected else "green"
         table.add_row(
-            f"{r.offset:,}",
-            f"{r.file_size:,}",
-            f"[{det_style}]{r.ratio}[/{det_style}]",
-            r.sha256[:16] + "…" if r.sha256 else "—",
+            f"{result.offset:,}",
+            f"{result.file_size:,}",
+            f"[{detection_style}]{result.ratio}[/{detection_style}]",
+            result.sha256[:16] + "…" if result.sha256 else "—",
         )
     return table
 
@@ -50,13 +66,13 @@ def _build_table(results: list[ScanResult]) -> Table:
     type=click.Choice(["linear", "bisect"]),
     default="linear",
     show_default=True,
-    help="linear: scan every increment; bisect: binary-search for first detection.",
+    help="linear: scan every increment; bisect: binary-search for first detection. Requires --api-key.",
 )
 @click.option(
     "--api-key", "-k",
     envvar="VT_API_KEY",
-    required=True,
-    help="VirusTotal API key (or set VT_API_KEY env var).",
+    default=None,
+    help="VirusTotal API key (or set VT_API_KEY). Omit to save slices to disk instead.",
 )
 @click.option(
     "--delay", "-d",
@@ -69,87 +85,154 @@ def _build_table(results: list[ScanResult]) -> Table:
     "--output", "-o",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
-    help="Write results to a JSON file.",
+    help="Write scan results to a JSON file (scan mode only).",
+)
+@click.option(
+    "--output-dir", "-O",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path("out"),
+    show_default=True,
+    help="Directory to write slices when no API key is provided.",
 )
 @click.option(
     "--dry-run",
     is_flag=True,
     default=False,
-    help="Print slice offsets without uploading anything.",
+    help="Print slice offsets without uploading or writing anything.",
 )
 def main(
     file: Path,
     increment: int,
     strategy: str,
-    api_key: str,
+    api_key: str | None,
     delay: float,
     output: Path | None,
+    output_dir: Path,
     dry_run: bool,
 ) -> None:
     """Trim FILE at byte increments and scan each slice on VirusTotal.
 
-    Useful for locating AV signature boundaries in binaries.
+    Without --api-key the slices are written to disk for manual upload.
 
     \b
     Examples:
-      avfiletrim malware.exe --increment 8192
-      avfiletrim sample.zip -i 4096 -s bisect -o results.json
-      VT_API_KEY=xxx avfiletrim payload.exe -i 1024 --dry-run
+      avfiletrim malware.exe -i 8192
+      avfiletrim malware.exe -i 4096 -O ./slices
+      avfiletrim malware.exe -i 4096 -s bisect -k $VT_API_KEY -o results.json
+      avfiletrim malware.exe -i 1024 --dry-run
     """
-    size = file.stat().st_size
-    console.print(f"[bold]AVFileTrim[/bold] — [cyan]{file.name}[/cyan] ({size:,} bytes)")
-    console.print(f"Strategy: [yellow]{strategy}[/yellow]  Increment: [yellow]{increment:,}[/yellow] bytes\n")
+    print_banner()
+
+    file_size = file.stat().st_size
+    console.print(f"[bold]Target:[/bold] [#ff69b4]{file.name}[/#ff69b4] ({file_size:,} bytes)")
+    console.print(f"[bold]Strategy:[/bold] [#ffb6c1]{strategy}[/#ffb6c1]   [bold]Increment:[/bold] [#ffb6c1]{increment:,}[/#ffb6c1] bytes\n")
 
     if dry_run:
-        offsets = [o for o, _ in iter_slices(file, increment)]
-        console.print(f"[dim]Dry run — {len(offsets)} slices would be uploaded:[/dim]")
-        for o in offsets:
-            console.print(f"  {o:,} bytes")
+        slice_offsets = [offset for offset, _ in iter_slices(file, increment)]
+        console.print(f"[dim]Dry run — {len(slice_offsets)} slices:[/dim]")
+        for offset in slice_offsets:
+            console.print(f"  {offset:,} bytes")
+        return
+
+    if not api_key:
+        run_offline(file, increment, output_dir)
         return
 
     job = TrimJob(source=file, increment=increment, strategy=strategy, api_key=api_key)
 
-    with VirusTotalClient(api_key=api_key, request_delay=delay) as vt:
+    with VirusTotalClient(api_key=api_key, request_delay=delay) as vt_client:
         if strategy == "linear":
-            _run_linear(vt, job, file)
+            run_linear_scan(vt_client, job, file)
         else:
-            _run_bisect(vt, job, file, increment)
+            run_bisect_scan(vt_client, job, file, increment)
 
     console.print()
-    console.print(_build_table(job.results))
+    console.print(build_results_table(job.results))
 
     if output:
-        _write_json(output, job)
+        write_json_results(output, job)
         console.print(f"\n[green]Results saved to {output}[/green]")
 
 
-def _run_linear(vt: VirusTotalClient, job: TrimJob, file: Path) -> None:
-    slices = list(iter_slices(file, job.increment))
-    total = len(slices)
+def run_offline(source: Path, increment: int, output_dir: Path) -> None:
+    """Write file slices to disk for manual upload — no API key required.
+
+    Args:
+        source: Path to the binary file to slice.
+        increment: Byte step between consecutive slices.
+        output_dir: Directory where slice files are written.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    slices = list(iter_slices(source, increment))
+    console.print(f"[#ffb6c1]No API key — saving {len(slices)} slices to[/#ffb6c1] [#ff69b4]{output_dir}/[/#ff69b4]\n")
+
+    for offset, data in slices:
+        digest = sha256_of(data)
+        slice_name = f"{source.stem}_{offset:010d}{source.suffix or '.bin'}"
+        slice_path = output_dir / slice_name
+        slice_path.write_bytes(data)
+        console.print(
+            f"  [#ff69b4]{offset:>10,}[/#ff69b4] bytes  "
+            f"sha256 [dim]{digest[:16]}…[/dim]  → {slice_path.name}"
+        )
+
+    console.print(f"\n[#ff69b4]Done — {len(slices)} slices written to {output_dir}/[/#ff69b4]")
+
+
+def run_linear_scan(vt_client: VirusTotalClient, job: TrimJob, source: Path) -> None:
+    """Upload every slice sequentially and record results.
+
+    Args:
+        vt_client: Authenticated VirusTotal client.
+        job: TrimJob holding configuration; results are appended in-place.
+        source: Path to the source binary.
+    """
+    slices = list(iter_slices(source, job.increment))
+    total_slices = len(slices)
 
     with console.status("") as status:
         for idx, (offset, data) in enumerate(slices, 1):
-            status.update(f"[cyan]Scanning slice {idx}/{total}[/cyan] — offset {offset:,}")
+            status.update(f"[cyan]Scanning slice {idx}/{total_slices}[/cyan] — offset {offset:,}")
             try:
-                result = vt.scan_bytes(data, offset, suffix=file.suffix or ".bin")
-            except VirusTotalError as exc:
-                console.print(f"[red]Error at offset {offset:,}: {exc}[/red]")
+                result = vt_client.scan_bytes(data, offset, suffix=source.suffix or ".bin")
+            except VirusTotalError as error:
+                console.print(f"[red]Error at offset {offset:,}: {error}[/red]")
                 continue
             job.results.append(result)
-            det = f"[red]{result.ratio}[/red]" if result.detected else f"[green]{result.ratio}[/green]"
-            console.print(f"  offset [cyan]{offset:>10,}[/cyan]  detections {det}")
+            detection_text = (
+                f"[red]{result.ratio}[/red]" if result.detected
+                else f"[green]{result.ratio}[/green]"
+            )
+            console.print(f"  offset [#ff69b4]{offset:>10,}[/#ff69b4]  detections {detection_text}")
 
 
-def _run_bisect(vt: VirusTotalClient, job: TrimJob, file: Path, increment: int) -> None:
-    """Binary search: find smallest offset that triggers detection."""
-    size = file.stat().st_size
-    lo, hi = increment, size
+def run_bisect_scan(
+    vt_client: VirusTotalClient,
+    job: TrimJob,
+    source: Path,
+    increment: int,
+) -> None:
+    """Binary-search for the smallest offset that triggers AV detection.
+
+    Scans the full file first; if detected, bisects to narrow down the
+    boundary at *increment* granularity.
+
+    Args:
+        vt_client: Authenticated VirusTotal client.
+        job: TrimJob holding configuration; results are appended in-place.
+        source: Path to the source binary.
+        increment: Granularity of the bisect (snapped to nearest multiple).
+    """
+    from .trimmer import slice_file
+
+    file_size = source.stat().st_size
+    low, high = increment, file_size
 
     console.print("[yellow]Bisect mode — scanning full file first…[/yellow]")
-    full_data = file.read_bytes()
+    full_data = source.read_bytes()
 
     with console.status("Scanning full file…"):
-        full_result = vt.scan_bytes(full_data, size, suffix=file.suffix or ".bin")
+        full_result = vt_client.scan_bytes(full_data, file_size, suffix=source.suffix or ".bin")
     job.results.append(full_result)
 
     if not full_result.detected:
@@ -158,44 +241,51 @@ def _run_bisect(vt: VirusTotalClient, job: TrimJob, file: Path, increment: int) 
 
     console.print(f"[red]Full file detected ({full_result.ratio}). Bisecting…[/red]\n")
 
-    from .trimmer import slice_file
-
-    while lo < hi:
-        mid = ((lo + hi) // 2 // increment) * increment or increment
-        if mid == lo:
+    while low < high:
+        mid = ((low + high) // 2 // increment) * increment or increment
+        if mid == low:
             break
 
-        with console.status(f"Bisect [{lo:,} … {hi:,}] — trying {mid:,}"):
-            data = slice_file(file, mid)
+        with console.status(f"Bisect [{low:,} … {high:,}] — trying {mid:,}"):
+            data = slice_file(source, mid)
             try:
-                result = vt.scan_bytes(data, mid, suffix=file.suffix or ".bin")
-            except VirusTotalError as exc:
-                console.print(f"[red]Error at {mid:,}: {exc}[/red]")
+                result = vt_client.scan_bytes(data, mid, suffix=source.suffix or ".bin")
+            except VirusTotalError as error:
+                console.print(f"[red]Error at {mid:,}: {error}[/red]")
                 break
         job.results.append(result)
 
-        det = f"[red]{result.ratio}[/red]" if result.detected else f"[green]{result.ratio}[/green]"
-        console.print(f"  bisect [cyan]{mid:>10,}[/cyan]  detections {det}")
+        detection_text = (
+            f"[red]{result.ratio}[/red]" if result.detected
+            else f"[green]{result.ratio}[/green]"
+        )
+        console.print(f"  bisect [#ff69b4]{mid:>10,}[/#ff69b4]  detections {detection_text}")
 
         if result.detected:
-            hi = mid
+            high = mid
         else:
-            lo = mid
+            low = mid
 
-    console.print(f"\n[bold]Signature boundary ~[cyan]{hi:,}[/cyan] bytes[/bold]")
+    console.print(f"\n[bold]Signature boundary ~[#ff69b4]{high:,}[/#ff69b4] bytes[/bold]")
 
 
-def _write_json(path: Path, job: TrimJob) -> None:
-    data = [
+def write_json_results(output_path: Path, job: TrimJob) -> None:
+    """Serialize all scan results to a JSON file.
+
+    Args:
+        output_path: Destination file path.
+        job: Completed TrimJob whose results are serialized.
+    """
+    records = [
         {
-            "offset": r.offset,
-            "file_size": r.file_size,
-            "sha256": r.sha256,
-            "detections": r.detections,
-            "total_engines": r.total_engines,
-            "permalink": r.permalink,
-            "engine_hits": r.engine_hits,
+            "offset": result.offset,
+            "file_size": result.file_size,
+            "sha256": result.sha256,
+            "detections": result.detections,
+            "total_engines": result.total_engines,
+            "permalink": result.permalink,
+            "engine_hits": result.engine_hits,
         }
-        for r in job.results
+        for result in job.results
     ]
-    path.write_text(json.dumps(data, indent=2))
+    output_path.write_text(json.dumps(records, indent=2))
